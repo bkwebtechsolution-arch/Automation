@@ -11,6 +11,8 @@ import zipfile
 import tempfile
 import urllib.request
 import urllib.parse
+import urllib.error
+import time
 import uuid
 import hmac
 
@@ -575,25 +577,25 @@ def _multipart_body(fields, file_field, filename, file_bytes):
 
 
 def convert_docx_to_pdf(docx_path, pdf_path):
+    """
+    Convert one DOCX with Gotenberg. Retries only transient upstream/network
+    failures; templates and document-generation logic are intentionally untouched.
+    """
     if not GOTENBERG_URL:
         raise RuntimeError(
-            "PDF converter is not configured. "
-            "Set the Vercel environment variable GOTENBERG_URL "
-            "to your deployed PDF converter URL."
+            "PDF converter is not configured. Set GOTENBERG_URL "
+            "to the deployed Gotenberg service URL."
         )
 
-    endpoint = (
-        GOTENBERG_URL
-        + "/forms/libreoffice/convert"
-    )
+    endpoint = GOTENBERG_URL + "/forms/libreoffice/convert"
+    timeout = max(10, int(os.environ.get("GOTENBERG_TIMEOUT_SECONDS", "180")))
+    max_attempts = max(1, min(3, int(os.environ.get("GOTENBERG_MAX_ATTEMPTS", "2"))))
 
+    # Read the file once, avoiding repeated disk reads if a transient retry is needed.
+    file_bytes = docx_path.read_bytes()
     body, content_type = _multipart_body(
-        {},
-        "files",
-        docx_path.name,
-        docx_path.read_bytes(),
+        {}, "files", docx_path.name, file_bytes
     )
-
     req = urllib.request.Request(
         endpoint,
         data=body,
@@ -601,28 +603,63 @@ def convert_docx_to_pdf(docx_path, pdf_path):
         headers={
             "Content-Type": content_type,
             "Content-Length": str(len(body)),
-            "User-Agent": "Vercel-Document-Automation/1.0",
+            "User-Agent": "Automaton-Documents-Replace/1.1",
         },
     )
 
-    try:
-        with urllib.request.urlopen(
-            req,
-            timeout=120,
-        ) as response:
-            pdf_bytes = response.read()
+    retryable_statuses = {502, 503, 504}
+    last_error = None
 
-    except Exception as exc:
-        raise RuntimeError(
-            f"PDF conversion service failed: {exc}"
-        ) from exc
+    for attempt in range(1, max_attempts + 1):
+        started = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                pdf_bytes = response.read()
 
-    if not pdf_bytes.startswith(b"%PDF"):
-        raise RuntimeError(
-            "PDF converter returned an invalid PDF."
+            elapsed = time.monotonic() - started
+            if not pdf_bytes.startswith(b"%PDF"):
+                raise RuntimeError(
+                    "Gotenberg responded, but the response was not a valid PDF."
+                )
+
+            pdf_path.write_bytes(pdf_bytes)
+            print(
+                f"PDF conversion succeeded: file={docx_path.name} "
+                f"attempt={attempt} seconds={elapsed:.2f} bytes={len(pdf_bytes)}",
+                flush=True,
+            )
+            return
+
+        except urllib.error.HTTPError as exc:
+            # Include a short response body: Gotenberg often explains the actual cause.
+            try:
+                detail = exc.read(1200).decode("utf-8", errors="replace").strip()
+            except Exception:
+                detail = ""
+            last_error = RuntimeError(
+                f"Gotenberg returned HTTP {exc.code}"
+                + (f": {detail}" if detail else "")
+            )
+            if exc.code not in retryable_statuses or attempt >= max_attempts:
+                raise last_error from exc
+
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            last_error = RuntimeError(
+                f"Could not reach Gotenberg at {endpoint}: {exc}"
+            )
+            if attempt >= max_attempts:
+                raise last_error from exc
+
+        # Small bounded backoff for temporary upstream failures only.
+        delay = 0.75 * attempt
+        print(
+            f"PDF conversion retry scheduled: file={docx_path.name} "
+            f"attempt={attempt} delay={delay:.2f}s error={last_error}",
+            flush=True,
         )
+        time.sleep(delay)
 
-    pdf_path.write_bytes(pdf_bytes)
+    raise last_error or RuntimeError("PDF conversion failed for an unknown reason.")
 
 
 # ============================================================
